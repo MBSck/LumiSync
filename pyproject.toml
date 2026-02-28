@@ -32,6 +32,8 @@ dependencies = [
   "qt-material>=2.14",
   "pywin32>=310; sys_platform == 'win32'",
   "mss>=10.1.0; sys_platform != 'win32'",
+  "pygobject>=3.56.0",
+  "opencv-python>=4.11.0.86",
 ]
 
 [tool.setuptools.packages.find]

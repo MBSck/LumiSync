@@ -1,6 +1,6 @@
 import socket
 import time
-from functools import partial
+from io import BytesIO
 from typing import Any, Dict, List, Tuple
 
 import colour
@@ -10,22 +10,34 @@ from PIL import Image
 from .. import connection, utils
 from ..config.options import BRIGHTNESS, GENERAL
 
+if GENERAL.platform == "Windows":
+    import dxcam
+elif GENERAL.compositor == "x11":
+    import mss
+elif GENERAL.compositor == "wayland":
+    import shutil
+
+    # TODO: In future, write an equally quick Python implementation
+    if shutil.which("flameshot") is None:
+        raise OSError("Screenshots in Wayland require flameshot!")
+
+    import subprocess
+
 
 class ScreenGrab:
-    """Facilitates taking a screenshot while supporting
+    """
+    Facilitates taking a screenshot while supporting
     different platforms and compositors (the latter for Unix).
     """
 
-    # Track the current dxcam instance so we can release it when switching displays
+    # NOTE: Track the current dxcam instance so we can release it when switching displays
     _dxcam_instance = None
     _dxcam_output_idx = None
 
     def __init__(self, *, display_index: int = 0) -> None:
         self.display_index = int(display_index)
         if GENERAL.platform == "Windows":
-            import dxcam
-
-            # dxcam caches camera instances globally. We must delete the old
+            # NOTE: dxcam caches camera instances globally. We must delete the old
             # instance before creating one for a different output.
             if (
                 ScreenGrab._dxcam_instance is not None
@@ -35,6 +47,7 @@ class ScreenGrab:
                     del ScreenGrab._dxcam_instance
                 except Exception:
                     pass
+
                 ScreenGrab._dxcam_instance = None
                 ScreenGrab._dxcam_output_idx = None
 
@@ -43,40 +56,53 @@ class ScreenGrab:
                     self.camera = dxcam.create(output_idx=self.display_index)
                 except TypeError:
                     try:
-                        self.camera = dxcam.create(device_idx=0, output_idx=self.display_index)
+                        self.camera = dxcam.create(
+                            device_idx=0, output_idx=self.display_index
+                        )
                     except TypeError:
                         self.camera = dxcam.create()
+
                 ScreenGrab._dxcam_instance = self.camera
                 ScreenGrab._dxcam_output_idx = self.display_index
             else:
                 self.camera = ScreenGrab._dxcam_instance
 
-            self.capture_method = self.camera.grab
-        else:
-            if GENERAL.compositor == "x11":
-                import mss
+        elif GENERAL.compositor == "x11":
+            self.camera = mss.mss()
 
-                self.camera = mss.mss()
-
-                # mss.monitors[0] is the virtual bounding box; [1..n] are real monitors
-                monitor_idx = self.display_index + 1
-                if monitor_idx < 1 or monitor_idx >= len(self.camera.monitors):
-                    monitor_idx = 1 if len(self.camera.monitors) > 1 else 0
-                self.capture_method = partial(self.camera.grab, self.camera.monitors[monitor_idx])
-            else:
-                # TODO: Implement Wayland support
-                raise NotImplementedError("Wayland support is not yet implemented in ScreenGrab.")
+            # NOTE: mss.monitors[0] is the virtual bounding box; [1..n] are real monitors
+            self.monitor_idx = self.display_index + 1
+            if self.monitor_idx < 1 or self.monitor_idx >= len(self.camera.monitors):
+                self.monitor_idx = 1 if len(self.camera.monitors) > 1 else 0
 
     def capture(self) -> Image.Image | None:
         """Captures a screenshot."""
-        screen = self.capture_method()
-        if screen is None:
-            return screen
+        if GENERAL.compositor == "wayland":
+            proc = subprocess.Popen(
+                ["flameshot", "full", "-r"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
-        if GENERAL.platform != "Windows" and GENERAL.compositor == "x11":
-            screen = np.array(screen)[..., [2, 1, 0]]
+            png_bytes, _ = proc.communicate()
+            if proc.returncode != 0:
+                return None
 
-        return Image.fromarray(screen)
+            img = Image.open(BytesIO(png_bytes))
+            img.load()
+            return img
+
+        if GENERAL.platform == "Windows":
+            screen = self.camera.grab()
+        elif GENERAL.compositor == "x11":
+            screen = self.camera.grab(self.camera.monitors[self.monitor_idx])
+            if screen is not None:
+                screen = np.array(screen)[..., [2, 1, 0]]
+
+        try:
+            return Image.fromarray(screen)
+        except AttributeError:
+            return None
 
 
 def start(server: socket.socket, device: Dict[str, Any]) -> None:
@@ -115,10 +141,11 @@ def start(server: socket.socket, device: Dict[str, Any]) -> None:
             )
             point = (int(img.size[0] / 2), int(img.size[1] / 2))
             colors.append(img.getpixel(point))
+
         img = screen.crop((int((width / 4 * 3)), top, width, bottom))
         colors.append(img.getpixel(point))
 
-        # Apply brightness setting to colors
+        # NOTE: Apply brightness setting to colors
         colors = apply_brightness(colors, BRIGHTNESS.monitor)
 
         smooth_transition(server, device, previous_colors, colors)
